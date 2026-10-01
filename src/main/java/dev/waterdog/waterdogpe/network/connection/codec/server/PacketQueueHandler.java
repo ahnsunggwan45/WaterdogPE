@@ -15,8 +15,10 @@ import java.util.Queue;
 @Log4j2
 public class PacketQueueHandler extends ChannelDuplexHandler {
     public static final String NAME = "packet-queue-handler";
-    private static final int MAX_BATCHES = 256;
-    private static final int MAX_PACKETS = 8000;
+    public static final int MAX_PACKETS = 100_000;
+    // Every batch holds at least one packet, so sizing the queue to the packet limit lets MAX_PACKETS decide.
+    // A smaller bound would not help anyway: netty raises any MPSC capacity below 2048 to 2048.
+    private static final int MAX_BATCHES = MAX_PACKETS;
 
     private final BedrockServerSession session;
 

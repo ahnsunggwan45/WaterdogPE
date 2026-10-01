@@ -20,6 +20,7 @@ import dev.waterdog.waterdogpe.network.connection.codec.server.PacketQueueHandle
 import dev.waterdog.waterdogpe.network.connection.peer.BedrockServerSession;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.cloudburstmc.protocol.bedrock.netty.BedrockBatchWrapper;
+import org.cloudburstmc.protocol.bedrock.netty.BedrockPacketWrapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -29,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 public class PacketQueueHandlerTest {
@@ -98,10 +100,29 @@ public class PacketQueueHandlerTest {
 
     @Test
     void overflowDisconnectsSession() {
-        // MAX_BATCHES is 256, but netty clamps MPSC queues to a minimum capacity of 2048.
-        for (int i = 0; i < 3000 && this.channel.pipeline().get(PacketQueueHandler.NAME) != null; i++) {
-            this.channel.writeOutbound(BedrockBatchWrapper.newInstance());
+        int packetsPerBatch = 1000;
+        int batches = PacketQueueHandler.MAX_PACKETS / packetsPerBatch + 1;
+        for (int i = 0; i < batches && this.channel.pipeline().get(PacketQueueHandler.NAME) != null; i++) {
+            this.channel.writeOutbound(batchOf(packetsPerBatch));
         }
         verify(this.session, atLeastOnce()).disconnect(any(CharSequence.class));
+    }
+
+    @Test
+    void holdsMoreBatchesThanTheOldQueueCapacityBelowThePacketLimit() {
+        // The queue used to be bounded at netty's minimum MPSC capacity of 2048 batches
+        for (int i = 0; i < 3000; i++) {
+            this.channel.writeOutbound(batchOf(1));
+        }
+        verify(this.session, never()).disconnect(any(CharSequence.class));
+        assertNull(this.channel.readOutbound(), "every batch should still be held in the queue");
+    }
+
+    private static BedrockBatchWrapper batchOf(int packets) {
+        BedrockBatchWrapper batch = BedrockBatchWrapper.newInstance();
+        for (int i = 0; i < packets; i++) {
+            batch.addPacket(BedrockPacketWrapper.create());
+        }
+        return batch;
     }
 }

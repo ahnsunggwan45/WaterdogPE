@@ -25,9 +25,11 @@ import dev.waterdog.waterdogpe.player.ProxiedPlayer;
 import dev.waterdog.waterdogpe.scheduler.TaskHandler;
 import org.cloudburstmc.protocol.common.PacketSignal;
 
+import java.util.HashMap;
 import java.util.LinkedList;
+import java.util.Map;
 import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * Upstream handler handling proxy manager resource packs.
@@ -36,9 +38,15 @@ public class ResourcePacksHandler extends AbstractUpstreamHandler {
 
     // Send one queued chunk every this many ticks instead of bursting them out.
     private static final int CHUNK_SEND_PERIOD = 4;
+    // Pending requests allowed per offered chunk, leaving room for re-requests but not floods.
+    private static final int MAX_PENDING_REQUESTS_PER_CHUNK = 4;
 
     private final Queue<ResourcePackDataInfoPacket> pendingPacks = new LinkedList<>();
-    private final Queue<ResourcePackChunkRequestPacket> pendingChunks = new ConcurrentLinkedQueue<>();
+    // LinkedBlockingQueue for its constant time size().
+    private final Queue<ResourcePackChunkRequestPacket> pendingChunks = new LinkedBlockingQueue<>();
+    // Packs offered to this client by id_version; only touched from packet handlers.
+    private final Map<String, ResourcePackDataInfoPacket> offeredPacks = new HashMap<>();
+    private long offeredChunks;
     private final LongSet sentChunks = new LongArraySet();
     private ResourcePackDataInfoPacket sendingPack;
     private TaskHandler<Runnable> sendTask;
@@ -62,7 +70,11 @@ public class ResourcePacksHandler extends AbstractUpstreamHandler {
                         this.player.disconnect("disconnectionScreen.resourcePack");
                         break;
                     }
-                    this.pendingPacks.offer(response);
+                    // Queue each pack once; ids repeated within or across SEND_PACKS would grow the queue.
+                    if (this.offeredPacks.putIfAbsent(packIdVer, response) == null) {
+                        this.offeredChunks += response.getChunkCount();
+                        this.pendingPacks.offer(response);
+                    }
                 }
                 this.sendNextPacket();
                 break;
@@ -84,6 +96,26 @@ public class ResourcePacksHandler extends AbstractUpstreamHandler {
 
     @Override
     public PacketSignal handle(ResourcePackChunkRequestPacket packet) {
+        if (!this.player.isConnected()) {
+            return this.cancel();
+        }
+
+        ResourcePackDataInfoPacket info = this.offeredPacks.get(packet.getPackId() + "_" + packet.getPackVersion());
+        if (info == null || packet.getChunkIndex() < 0 || packet.getChunkIndex() >= info.getChunkCount()) {
+            this.player.getLogger().debug("[{}|{}] Ignoring invalid request for chunk {} of resource pack {}_{}",
+                    this.player.getAddress(), this.player.getName(), packet.getChunkIndex(), packet.getPackId(), packet.getPackVersion());
+            return this.cancel();
+        }
+
+        if (this.pendingChunks.size() >= this.offeredChunks * MAX_PENDING_REQUESTS_PER_CHUNK) {
+            this.player.getLogger().warning("[{}|{}] Sent too many resource pack chunk requests ({} pending), disconnecting",
+                    this.player.getAddress(), this.player.getName(), this.pendingChunks.size());
+            this.stopSending();
+            this.pendingChunks.clear();
+            this.player.disconnect("disconnectionScreen.resourcePack");
+            return this.cancel();
+        }
+
         this.queueChunk(packet);
         return this.cancel();
     }

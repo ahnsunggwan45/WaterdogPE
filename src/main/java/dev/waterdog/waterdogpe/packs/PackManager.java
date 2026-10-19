@@ -51,8 +51,9 @@ import java.util.UUID;
 public class PackManager {
 
     /**
-     * Default size of an in-protocol pack chunk. 256 KiB chunks crashed mobile clients twice after
-     * upstream merges reverted this; PackManagerTest fails if the default drifts again.
+     * Default size of an in-protocol pack chunk, the same as BDS so the client's progress bar moves a
+     * chunk at a time. 256 KiB chunks were in use when mobile clients crashed while downloading packs;
+     * PackManagerTest and PackChunkSizeTest fail if the default drifts.
      */
     public static final int DEFAULT_CHUNK_SIZE = 100 * 1024;
     public static final int MIN_CHUNK_SIZE = 16 * 1024;
@@ -523,19 +524,12 @@ public class PackManager {
     }
 
     public ResourcePackChunkDataPacket packChunkDataPacket(String idVersion, ResourcePackChunkRequestPacket from) {
-        return this.packChunkDataPacket(idVersion, from, this.chunkSize);
-    }
-
-    /**
-     * @param chunkSize the chunk size the client was told in its ResourcePackDataInfoPacket, so a
-     *                  reload changing pack_chunk_size mid-download does not shift chunk offsets.
-     */
-    public ResourcePackChunkDataPacket packChunkDataPacket(String idVersion, ResourcePackChunkRequestPacket from, long chunkSize) {
         ResourcePack resourcePack = this.packsByIdVer.get(idVersion);
         if (resourcePack == null) {
             return null;
         }
 
+        long chunkSize = this.chunkSize;
         long offset = chunkSize * from.getChunkIndex();
         ResourcePackChunkDataPacket packet = new ResourcePackChunkDataPacket();
         packet.setPackId(from.getPackId());

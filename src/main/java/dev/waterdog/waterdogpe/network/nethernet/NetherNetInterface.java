@@ -127,7 +127,7 @@ public class NetherNetInterface implements NetworkInterface, SignalingService {
                     .option(NetherChannelOption.NETHER_SERVER_RTC_HANDSHAKE_TIMEOUT_SECONDS,
                             NetherNetProperties.HANDSHAKE_TIMEOUT)
                     .option(NetherChannelOption.NETHER_SERVER_METRICS, this.serverMetrics)
-                    .childHandler(new NetherNetServerSessionInitializer(this.proxy));
+                    .childHandler(new NetherNetServerSessionInitializer(this.proxy, null));
             if (icePort > 0) {
                 // Media on its own port, because the signaling port is only free on the TCP side
                 bootstrap.option(NetherChannelOption.NETHER_SERVER_ICE_ADDRESS,
@@ -202,7 +202,7 @@ public class NetherNetInterface implements NetworkInterface, SignalingService {
                 .setIceOnLocalPort(false)
                 // A peer may be another proxy signing its own assertion, which no auth service issued
                 .setTokenTrust(TokenTrust.ANY)
-                .setMotdProvider((host, client) -> this.advertisement(client))
+                .setMotdProvider((host, client, info) -> this.advertisement(client))
                 .setPlayerFilter((host, player) -> this.acceptsConnections());
 
         HttpsSettings https = settings.getHttps();
@@ -331,7 +331,7 @@ public class NetherNetInterface implements NetworkInterface, SignalingService {
         if (this.bindings.isEmpty()) {
             return CompletableFuture.failedFuture(new IllegalStateException("NetherNet is not bound"));
         }
-        return this.bindings.get(0).signaling().acceptOffer(networkId, offer, clientAddress, null);
+        return this.bindings.get(0).signaling().acceptOffer(networkId, offer, clientAddress, null, null);
     }
 
     @Override

@@ -17,7 +17,6 @@ package dev.waterdog.waterdogpe.event;
 
 import dev.waterdog.waterdogpe.ProxyServer;
 import dev.waterdog.waterdogpe.utils.ThreadFactoryBuilder;
-import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import lombok.Getter;
 
 import java.util.concurrent.*;
@@ -33,7 +32,11 @@ public class EventManager {
     private final ProxyServer proxy;
     @Getter
     private final ExecutorService threadedExecutor;
-    private final Object2ObjectOpenHashMap<Class<? extends Event>, EventHandler> handlerMap = new Object2ObjectOpenHashMap<>();
+    /**
+     * Written by callEvent on every player's netty thread, so it must be concurrent:
+     * racing inserts into a plain hash map corrupt it and break every later call.
+     */
+    private final ConcurrentHashMap<Class<? extends Event>, EventHandler> handlerMap = new ConcurrentHashMap<>();
 
     public EventManager(ProxyServer proxy) {
         this.proxy = proxy;

@@ -50,7 +50,13 @@ import java.util.UUID;
 
 public class PackManager {
 
-    private static final long CHUNK_SIZE = 1024 * 256;
+    /**
+     * Default size of an in-protocol pack chunk. 256 KiB chunks crashed mobile clients twice after
+     * upstream merges reverted this; PackManagerTest fails if the default drifts again.
+     */
+    public static final int DEFAULT_CHUNK_SIZE = 100 * 1024;
+    public static final int MIN_CHUNK_SIZE = 16 * 1024;
+    public static final int MAX_CHUNK_SIZE = 256 * 1024;
 
     private static final PathMatcher ZIP_PACK_MATCHER = FileSystems.getDefault().getPathMatcher("glob:**.{zip,mcpack}");
     private static final List<ResourcePackStackPacket.Entry> EDU_PACKS = List.of(
@@ -77,6 +83,9 @@ public class PackManager {
     private ResourcePacksInfoPacket noCdnPacksInfoPacket;
 
     private Set<Platform> disabledCdnPlatforms = EnumSet.noneOf(Platform.class);
+
+    @Getter
+    private volatile int chunkSize = DEFAULT_CHUNK_SIZE;
 
     // Directories loadPacks has been called with; reloadPacks re-scans all of them.
     private final List<Path> packDirectories = new ArrayList<>();
@@ -123,6 +132,11 @@ public class PackManager {
 
         Path cacheDirectory = this.cdnCacheDirectory();
         Set<Platform> disabled = this.parseDisabledCdnPlatforms();
+        int configuredChunkSize = this.proxy.getConfiguration().getPackChunkSize();
+        this.chunkSize = clampChunkSize(configuredChunkSize);
+        if (this.chunkSize != configuredChunkSize) {
+            this.proxy.getLogger().warning("pack_chunk_size " + configuredChunkSize + " is out of range, using " + this.chunkSize + " instead");
+        }
         Map<UUID, ResourcePack> newPacks = new HashMap<>();
         Map<String, ResourcePack> newPacksByIdVer = new HashMap<>();
 
@@ -156,6 +170,17 @@ public class PackManager {
         }
 
         this.proxy.getLogger().info("Loaded " + this.packs.size() + " packs!");
+    }
+
+    /**
+     * Keeps a configured chunk size within what clients are known to handle; zero or negative
+     * values fall back to the default.
+     */
+    public static int clampChunkSize(int chunkSize) {
+        if (chunkSize <= 0) {
+            return DEFAULT_CHUNK_SIZE;
+        }
+        return Math.max(MIN_CHUNK_SIZE, Math.min(MAX_CHUNK_SIZE, chunkSize));
     }
 
     private Path cdnCacheDirectory() {
@@ -328,7 +353,7 @@ public class PackManager {
             if (pack != null) {
                 return pack;
             }
-            this.proxy.getLogger().error("Resource pack manifest.json is invalid or was not found in " + packPath.getFileName() + ", please make sure that you zip the content of the pack and not the folder! Read more on troubleshooting here: https://docs.waterdog.dev/books/waterdogpe-setup/page/troubleshooting");
+            this.proxy.getLogger().error("Resource pack manifest.json is invalid or was not found in " + packPath.getFileName() + ", please make sure it sits at the zip root or inside a single top-level folder! Read more on troubleshooting here: https://docs.waterdog.dev/books/waterdogpe-setup/page/troubleshooting");
         } catch (Exception e) {
             this.proxy.getLogger().error("Can not load resource pack from: " + packPath.getFileName(), e);
         }
@@ -485,7 +510,7 @@ public class PackManager {
         ResourcePackDataInfoPacket packet = new ResourcePackDataInfoPacket();
         packet.setPackId(resourcePack.getPackId());
         packet.setPackVersion(resourcePack.getVersion().toString());
-        packet.setMaxChunkSize(CHUNK_SIZE);
+        packet.setMaxChunkSize(this.chunkSize);
         packet.setChunkCount((resourcePack.getPackSize() - 1) / packet.getMaxChunkSize() + 1);
         packet.setCompressedPackSize(resourcePack.getPackSize());
         packet.setHash(resourcePack.getHash());
@@ -498,17 +523,26 @@ public class PackManager {
     }
 
     public ResourcePackChunkDataPacket packChunkDataPacket(String idVersion, ResourcePackChunkRequestPacket from) {
+        return this.packChunkDataPacket(idVersion, from, this.chunkSize);
+    }
+
+    /**
+     * @param chunkSize the chunk size the client was told in its ResourcePackDataInfoPacket, so a
+     *                  reload changing pack_chunk_size mid-download does not shift chunk offsets.
+     */
+    public ResourcePackChunkDataPacket packChunkDataPacket(String idVersion, ResourcePackChunkRequestPacket from, long chunkSize) {
         ResourcePack resourcePack = this.packsByIdVer.get(idVersion);
         if (resourcePack == null) {
             return null;
         }
 
+        long offset = chunkSize * from.getChunkIndex();
         ResourcePackChunkDataPacket packet = new ResourcePackChunkDataPacket();
         packet.setPackId(from.getPackId());
         packet.setPackVersion(from.getPackVersion());
         packet.setChunkIndex(from.getChunkIndex());
-        packet.setData(Unpooled.wrappedBuffer(resourcePack.getChunk((int) CHUNK_SIZE * from.getChunkIndex(), (int) CHUNK_SIZE)));
-        packet.setProgress(CHUNK_SIZE * from.getChunkIndex());
+        packet.setData(Unpooled.wrappedBuffer(resourcePack.getChunk((int) offset, (int) chunkSize)));
+        packet.setProgress(offset);
         return packet;
     }
 

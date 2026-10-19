@@ -17,6 +17,7 @@ package dev.waterdog.waterdogpe.utils.config.proxy;
 
 import dev.waterdog.waterdogpe.ProxyServer;
 import dev.waterdog.waterdogpe.network.connection.codec.compression.CompressionType;
+import dev.waterdog.waterdogpe.packs.PackManager;
 import dev.waterdog.waterdogpe.utils.config.ServerList;
 import dev.waterdog.waterdogpe.utils.config.serializer.CompressionAlgorithmConverter;
 import dev.waterdog.waterdogpe.utils.config.serializer.InetSocketAddressConverter;
@@ -180,6 +181,13 @@ public class ProxyConfig extends YamlConfig {
     @Path("pack_cache_size")
     @Comment("You can set maximum pack size in MB to be cached.")
     private int packCacheSize = 16;
+
+    @Path("pack_chunk_size")
+    @Comments({
+            "Size in bytes of each chunk when resource packs are sent through the in-protocol chunked transfer.",
+            "Values outside 16384..262144 are clamped. 262144 (256 KiB) chunks are known to crash some mobile clients, keep the default unless you have tested otherwise."
+    })
+    private int packChunkSize = PackManager.DEFAULT_CHUNK_SIZE;
 
     @Path("pack_cdn_urls")
     @Comments({

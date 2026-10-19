@@ -75,6 +75,8 @@ public class BedrockServerInfo extends ServerInfo {
                 .option(RakChannelOption.RAK_PROTOCOL_VERSION, version.getRaknetVersion())
                 .option(RakChannelOption.RAK_ORDERING_CHANNELS, 1)
                 .option(RakChannelOption.RAK_CONNECT_TIMEOUT, networkSettings.getConnectTimeout() * 1000L)
+                // Fixed on purpose: network_settings.session_timeout only stretches the client leg. Raising
+                // it here would make the proxy notice a dead downstream later and slow transfer recovery.
                 .option(RakChannelOption.RAK_SESSION_TIMEOUT, 10000L)
                 .option(RakChannelOption.RAK_MTU, networkSettings.getMaximumDownstreamMtu())
                 .handler(new ProxiedClientSessionInitializer(player, serverInfo, promise));

@@ -72,7 +72,7 @@ public class RakNetInterface implements NetworkInterface {
                         .option(RakChannelOption.RAK_SERVER_COOKIE_MODE, this.server.getNetworkSettings().enableCookies() ?
                                 RakServerCookieMode.ACTIVE : RakServerCookieMode.INVALID)
                         .option(RakChannelOption.RAK_PROXY_PROTOCOL, this.server.getNetworkSettings().enableProxyProtocol())
-                        .childOption(RakChannelOption.RAK_SESSION_TIMEOUT, 10000L)
+                        .childOption(RakChannelOption.RAK_SESSION_TIMEOUT, this.server.getNetworkSettings().sessionTimeoutMillis())
                         .childOption(RakChannelOption.RAK_ORDERING_CHANNELS, 1)
                         .handler(new OfflineServerChannelInitializer(this.server))
                         .childHandler(new ProxiedServerSessionInitializer(this.server));

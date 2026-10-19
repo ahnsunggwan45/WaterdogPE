@@ -73,6 +73,19 @@ public class NetworkSettings extends SettingsSection {
     @Comment("How many seconds a connection has to complete the login handshake (network settings -> login -> client-to-server handshake) before it is disconnected. Set to 0 to disable.")
     private int loginTimeout = 10;
 
+    @Path("session_timeout")
+    @Accessors(fluent = true)
+    @Comment("How many seconds a client connection may receive nothing before RakNet drops it as timed out. Raising this lets players on poor mobile links survive short stalls instead of being disconnected, at the cost of dead connections lingering longer. Only affects client <-> proxy over RakNet; the proxy <-> server leg stays fixed so a dead downstream is still noticed quickly.")
+    private int sessionTimeout = 10;
+
+    /**
+     * The configured session timeout in the milliseconds RakNet expects. Zero or negative would make
+     * RakNet drop every session at once, so those fall back to the default.
+     */
+    public long sessionTimeoutMillis() {
+        return (this.sessionTimeout > 0 ? this.sessionTimeout : 10) * 1000L;
+    }
+
     @Path("random_downstream_loopback_address")
     @Accessors(fluent = true)
     @Comment("Bind each downstream connection to a random 127.0.0.0/8 source address when the target server is on loopback. Certain server softwares like BDS rate limit connections per IP, this causes problems when transferring multiple players at the same time to a certain server. Requires an OS that allows binding the whole loopback range.")

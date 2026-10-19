@@ -17,6 +17,7 @@ package dev.waterdog.waterdogpe.network.protocol.handler.upstream;
 
 import dev.waterdog.waterdogpe.ProxyServer;
 import dev.waterdog.waterdogpe.logger.MainLogger;
+import dev.waterdog.waterdogpe.network.connection.peer.BedrockServerSession;
 import dev.waterdog.waterdogpe.packs.PackManager;
 import dev.waterdog.waterdogpe.player.ProxiedPlayer;
 import dev.waterdog.waterdogpe.scheduler.TaskHandler;
@@ -26,6 +27,8 @@ import org.cloudburstmc.protocol.bedrock.packet.ResourcePackChunkDataPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePackChunkRequestPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePackClientResponsePacket;
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePackDataInfoPacket;
+import org.cloudburstmc.protocol.bedrock.packet.ResourcePacksInfoPacket;
+import io.netty.buffer.Unpooled;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -33,10 +36,13 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
@@ -57,6 +63,9 @@ public class ResourcePacksHandlerTest {
     private final WaterdogScheduler scheduler = mock(WaterdogScheduler.class);
     private final PackManager packManager = mock(PackManager.class);
     private final ProxiedPlayer player = mock(ProxiedPlayer.class);
+    private final MainLogger logger = mock(MainLogger.class);
+    // Formatted info lines the handler logged.
+    private final List<String> infoLines = new ArrayList<>();
     @SuppressWarnings("unchecked")
     private final TaskHandler<Runnable> sendTask = mock(TaskHandler.class);
     private final List<Runnable> scheduledTasks = new ArrayList<>();
@@ -78,18 +87,28 @@ public class ResourcePacksHandlerTest {
         this.info.setMaxChunkSize(1024);
         this.info.setChunkCount(CHUNK_COUNT);
         when(this.packManager.packInfoFromIdVer(PACK_ID_VER)).thenReturn(this.info);
-        when(this.packManager.packChunkDataPacket(anyString(), any(ResourcePackChunkRequestPacket.class))).thenAnswer(invocation -> {
+        when(this.packManager.packChunkDataPacket(anyString(), any(ResourcePackChunkRequestPacket.class), anyLong())).thenAnswer(invocation -> {
             ResourcePackChunkRequestPacket request = invocation.getArgument(1);
             ResourcePackChunkDataPacket data = new ResourcePackChunkDataPacket();
             data.setPackId(request.getPackId());
             data.setPackVersion(request.getPackVersion());
             data.setChunkIndex(request.getChunkIndex());
+            data.setData(Unpooled.wrappedBuffer(new byte[(int) (long) invocation.getArgument(2)]));
             return data;
         });
 
         when(this.player.getProxy()).thenReturn(this.proxy);
         when(this.player.isConnected()).thenReturn(true);
-        when(this.player.getLogger()).thenReturn(mock(MainLogger.class));
+        when(this.player.getLogger()).thenReturn(this.logger);
+        doAnswer(invocation -> {
+            Object[] args = invocation.getArguments();
+            String line = (String) args[0];
+            for (int i = 1; i < args.length; i++) {
+                line = line.replaceFirst("\\{}", java.util.regex.Matcher.quoteReplacement(String.valueOf(args[i])));
+            }
+            this.infoLines.add(line);
+            return null;
+        }).when(this.logger).info(anyString(), any(Object[].class));
 
         TransferTestHarness.setProxyInstance(this.proxy);
         this.handler = new ResourcePacksHandler(this.player);
@@ -164,6 +183,86 @@ public class ResourcePacksHandlerTest {
             this.handler.handle(chunkRequest(i % CHUNK_COUNT));
         }
         verify(this.player).disconnect((CharSequence) "disconnectionScreen.resourcePack");
+    }
+
+    @Test
+    public void cdnPackFetchedInProtocolIsLoggedOncePerPack() {
+        this.handler = new ResourcePacksHandler(this.player, infoPacket("https://cdn.example/pack.zip"));
+        this.offerPack(PACK_ID_VER);
+        for (int i = 0; i < CHUNK_COUNT; i++) {
+            this.handler.handle(chunkRequest(i));
+        }
+        this.offerPack(PACK_ID_VER);
+
+        List<String> cdnLines = this.linesTagged("[PackCDN]");
+        assertEquals(1, cdnLines.size());
+        assertTrue(cdnLines.get(0).contains(PACK_ID_VER), cdnLines.get(0));
+        assertTrue(cdnLines.get(0).contains("transport="), cdnLines.get(0));
+    }
+
+    @Test
+    public void packWithoutCdnUrlIsNotLoggedAsCdnFallback() {
+        this.handler = new ResourcePacksHandler(this.player, infoPacket(null));
+        this.offerPack(PACK_ID_VER);
+        this.handler.handle(chunkRequest(0));
+
+        assertEquals(0, this.linesTagged("[PackCDN]").size());
+    }
+
+    @Test
+    public void completedLogsPhaseWithChunkBytes() {
+        this.offerPack(PACK_ID_VER);
+        for (int i = 0; i < CHUNK_COUNT; i++) {
+            this.handler.handle(chunkRequest(i));
+        }
+        Runnable sendNextChunk = this.scheduledTasks.get(0);
+        for (int i = 0; i < CHUNK_COUNT; i++) {
+            sendNextChunk.run();
+        }
+        this.respond(ResourcePackClientResponsePacket.Status.COMPLETED);
+        this.respond(ResourcePackClientResponsePacket.Status.COMPLETED);
+
+        List<String> phaseLines = this.linesTagged("[PackPhase]");
+        assertEquals(1, phaseLines.size());
+        String line = phaseLines.get(0);
+        assertTrue(line.contains("completed"), line);
+        assertTrue(line.contains("chunks=" + CHUNK_COUNT), line);
+        // The stub returns chunks as large as the chunk size from the data info packet.
+        assertTrue(line.contains("chunkBytes=" + CHUNK_COUNT * 1024), line);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void disconnectDuringPackStageLogsPhaseOnce() {
+        BedrockServerSession connection = mock(BedrockServerSession.class);
+        List<Consumer<CharSequence>> listeners = new ArrayList<>();
+        doAnswer(invocation -> listeners.add(invocation.getArgument(0))).when(connection).addDisconnectListener(any());
+        when(this.player.getConnection()).thenReturn(connection);
+        this.handler = new ResourcePacksHandler(this.player, infoPacket(null));
+
+        listeners.forEach(listener -> listener.accept("timeout"));
+        this.respond(ResourcePackClientResponsePacket.Status.COMPLETED);
+
+        List<String> phaseLines = this.linesTagged("[PackPhase]");
+        assertEquals(1, phaseLines.size());
+        assertTrue(phaseLines.get(0).contains("aborted (timeout)"), phaseLines.get(0));
+    }
+
+    private List<String> linesTagged(String tag) {
+        return this.infoLines.stream().filter(line -> line.startsWith(tag)).toList();
+    }
+
+    private void respond(ResourcePackClientResponsePacket.Status status) {
+        ResourcePackClientResponsePacket response = new ResourcePackClientResponsePacket();
+        response.setStatus(status);
+        this.handler.handle(response);
+    }
+
+    private static ResourcePacksInfoPacket infoPacket(String cdnUrl) {
+        ResourcePacksInfoPacket packet = new ResourcePacksInfoPacket();
+        packet.getResourcePackInfos().add(new ResourcePacksInfoPacket.Entry(PACK_ID, PACK_VERSION, 3 * 1024L,
+                "", "", "", false, false, false, cdnUrl));
+        return packet;
     }
 
     private void offerPack(String... packIdVers) {

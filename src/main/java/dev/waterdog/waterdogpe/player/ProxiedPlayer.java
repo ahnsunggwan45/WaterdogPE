@@ -240,7 +240,7 @@ public class ProxiedPlayer implements CommandSender {
             this.acceptResourcePacks = false;
             this.initialConnect();
         } else {
-            this.connection.setPacketHandler(new ResourcePacksHandler(this));
+            this.connection.setPacketHandler(new ResourcePacksHandler(this, event.getPacket()));
             this.connection.sendPacket(event.getPacket());
         }
     }

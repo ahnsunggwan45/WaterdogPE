@@ -16,6 +16,9 @@
 package dev.waterdog.waterdogpe.network.protocol.handler.upstream;
 
 import dev.waterdog.waterdogpe.ProxyServer;
+import dev.waterdog.waterdogpe.network.connection.TransportProfile;
+import dev.waterdog.waterdogpe.network.connection.peer.BedrockServerSession;
+import dev.waterdog.waterdogpe.packs.types.ResourcePack;
 import it.unimi.dsi.fastutil.longs.LongArraySet;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import org.cloudburstmc.protocol.bedrock.packet.*;
@@ -26,10 +29,15 @@ import dev.waterdog.waterdogpe.scheduler.TaskHandler;
 import org.cloudburstmc.protocol.common.PacketSignal;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Upstream handler handling proxy manager resource packs.
@@ -51,8 +59,49 @@ public class ResourcePacksHandler extends AbstractUpstreamHandler {
     private ResourcePackDataInfoPacket sendingPack;
     private TaskHandler<Runnable> sendTask;
 
+    // Diagnostics: whether clients really download CDN packs from their URL, and how long the pack
+    // stage takes. Grep the log for [PackCDN] and [PackPhase].
+    private final long phaseStartNanos = System.nanoTime();
+    // id_version of the packs whose ResourcePacksInfoPacket entry carried a CDN URL for this client.
+    private final Set<String> cdnPackIds = new HashSet<>();
+    // CDN packs this client asked for in-protocol anyway, logged once each.
+    private final Set<String> cdnFallbackPacks = new HashSet<>();
+    private final AtomicLong chunksSent = new AtomicLong();
+    private final AtomicLong chunkBytesSent = new AtomicLong();
+    private final AtomicBoolean phaseLogged = new AtomicBoolean();
+
     public ResourcePacksHandler(ProxiedPlayer player) {
+        this(player, null);
+    }
+
+    /**
+     * @param sentInfo the ResourcePacksInfoPacket sent to this client right before this handler took
+     *                 over, used to tell which packs it was offered through a CDN URL.
+     */
+    public ResourcePacksHandler(ProxiedPlayer player, ResourcePacksInfoPacket sentInfo) {
         super(player);
+        if (sentInfo != null) {
+            this.collectCdnPacks(sentInfo);
+        }
+        BedrockServerSession connection = player.getConnection();
+        if (connection != null) {
+            connection.addDisconnectListener(reason -> this.logPhase("aborted (" + reason + ")"));
+        }
+    }
+
+    private void collectCdnPacks(ResourcePacksInfoPacket sentInfo) {
+        for (ResourcePacksInfoPacket.Entry entry : sentInfo.getResourcePackInfos()) {
+            this.collectCdnPack(entry);
+        }
+        for (ResourcePacksInfoPacket.Entry entry : sentInfo.getBehaviorPackInfos()) {
+            this.collectCdnPack(entry);
+        }
+    }
+
+    private void collectCdnPack(ResourcePacksInfoPacket.Entry entry) {
+        if (entry.getCdnUrl() != null && !entry.getCdnUrl().isEmpty()) {
+            this.cdnPackIds.add(entry.getPackId() + "_" + entry.getPackVersion());
+        }
     }
 
     @Override
@@ -70,6 +119,7 @@ public class ResourcePacksHandler extends AbstractUpstreamHandler {
                         this.player.disconnect("disconnectionScreen.resourcePack");
                         break;
                     }
+                    this.noteCdnFallback(packIdVer, "data info request");
                     // Queue each pack once; ids repeated within or across SEND_PACKS would grow the queue.
                     if (this.offeredPacks.putIfAbsent(packIdVer, response) == null) {
                         this.offeredChunks += response.getChunkCount();
@@ -85,6 +135,7 @@ public class ResourcePacksHandler extends AbstractUpstreamHandler {
                 break;
             case COMPLETED:
                 this.stopSending();
+                this.logPhase("completed");
                 if (!this.player.hasUpstreamBridge()) {
                     this.player.initialConnect(); // First connection
                 }
@@ -100,7 +151,8 @@ public class ResourcePacksHandler extends AbstractUpstreamHandler {
             return this.cancel();
         }
 
-        ResourcePackDataInfoPacket info = this.offeredPacks.get(packet.getPackId() + "_" + packet.getPackVersion());
+        String packIdVer = packet.getPackId() + "_" + packet.getPackVersion();
+        ResourcePackDataInfoPacket info = this.offeredPacks.get(packIdVer);
         if (info == null || packet.getChunkIndex() < 0 || packet.getChunkIndex() >= info.getChunkCount()) {
             this.player.getLogger().debug("[{}|{}] Ignoring invalid request for chunk {} of resource pack {}_{}",
                     this.player.getAddress(), this.player.getName(), packet.getChunkIndex(), packet.getPackId(), packet.getPackVersion());
@@ -116,8 +168,45 @@ public class ResourcePacksHandler extends AbstractUpstreamHandler {
             return this.cancel();
         }
 
+        this.noteCdnFallback(packIdVer, "chunk request");
         this.queueChunk(packet);
         return this.cancel();
+    }
+
+    /**
+     * Logs, once per pack and session, a client fetching a pack in-protocol although it was given a
+     * CDN URL for it, i.e. it did not (or could not) download from the CDN.
+     */
+    private void noteCdnFallback(String packIdVer, String via) {
+        if (!this.cdnPackIds.contains(packIdVer) || !this.cdnFallbackPacks.add(packIdVer)) {
+            return;
+        }
+        ResourcePack pack = this.player.getProxy().getPackManager().getPacksByIdVer().get(packIdVer);
+        this.player.getLogger().info("[PackCDN] [{}|{}] Fetching CDN pack {} ({}) in-protocol via {} instead of its URL, platform={} transport={}",
+                this.player.getAddress(), this.player.getName(), pack == null ? "?" : pack.getPackName(), packIdVer, via,
+                this.player.getDevicePlatform(), this.transportName());
+    }
+
+    /**
+     * Logs one line per session for the pack stage, from sending ResourcePacksInfoPacket until the
+     * client reports COMPLETED or disconnects.
+     */
+    private void logPhase(String outcome) {
+        if (!this.phaseLogged.compareAndSet(false, true)) {
+            return;
+        }
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - this.phaseStartNanos);
+        this.player.getLogger().info("[PackPhase] [{}|{}] Pack stage {} after {}ms, platform={} transport={} cdnOffered={} cdnFetchedInProtocol={} packsRequested={} chunks={} chunkBytes={}",
+                this.player.getAddress(), this.player.getName(), outcome, elapsedMillis, this.player.getDevicePlatform(), this.transportName(),
+                this.cdnPackIds.size(), this.cdnFallbackPacks.size(), this.offeredPacks.size(), this.chunksSent.get(), this.chunkBytesSent.get());
+    }
+
+    private String transportName() {
+        BedrockServerSession connection = this.player.getConnection();
+        if (connection == null || connection.getPeer() == null) {
+            return "unknown";
+        }
+        return connection.getPeer().getTransportProfile() == TransportProfile.NETHERNET ? "NetherNet" : "RakNet";
     }
 
     private void queueChunk(ResourcePackChunkRequestPacket packet) {
@@ -139,13 +228,19 @@ public class ResourcePacksHandler extends AbstractUpstreamHandler {
         }
 
         PackManager packManager = this.player.getProxy().getPackManager();
-        ResourcePackChunkDataPacket response = packManager.packChunkDataPacket(request.getPackId() + "_" + request.getPackVersion(), request);
+        String packIdVer = request.getPackId() + "_" + request.getPackVersion();
+        ResourcePackDataInfoPacket info = this.offeredPacks.get(packIdVer);
+        ResourcePackChunkDataPacket response = info == null ? null : packManager.packChunkDataPacket(packIdVer, request, info.getMaxChunkSize());
         if (response == null) {
             this.player.disconnect("Unknown resource pack!");
             this.stopSending();
             return;
         }
 
+        if (response.getData() != null) {
+            this.chunkBytesSent.addAndGet(response.getData().readableBytes());
+        }
+        this.chunksSent.incrementAndGet();
         this.player.sendPacket(response);
         this.sentChunks.add(response.getChunkIndex());
         if (this.sendingPack != null && this.sentChunks.size() >= this.sendingPack.getChunkCount()) {
